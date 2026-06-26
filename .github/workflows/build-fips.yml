@@ -89,9 +89,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             TRAEFIK_VERSION=${{ steps.version.outputs.traefik_version }}
-          # Build-Cache über GitHub Actions Cache
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           # Multi-Arch: amd64 und arm64 (BoringCrypto unterstützt beide)
           platforms: linux/amd64,linux/arm64
 
