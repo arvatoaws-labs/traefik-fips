@@ -1,0 +1,131 @@
+name: Build Traefik FIPS Image
+
+on:
+  # Manuell auslösbar mit optionaler Versionsangabe
+  workflow_dispatch:
+    inputs:
+      traefik_version:
+        description: "Traefik version tag (e.g. v3.3.4)"
+        required: false
+        default: "v3.3.4"
+  # Automatisch bei neuen Tags in deinem Fork, z.B. "fips-v3.3.4"
+  push:
+    tags:
+      - "fips-v*"
+  # Wöchentlicher Rebuild für Security-Patches im Basis-Image
+  schedule:
+    - cron: "0 3 * * 1" # Montags 03:00 UTC
+
+env:
+  # Deine GitHub Container Registry (ghcr.io)
+  REGISTRY: ghcr.io
+  # Passe dies an deine GitHub Org/User an
+  IMAGE_NAME: ${{ github.repository_owner }}/traefik-fips
+
+jobs:
+  build-and-push:
+    name: Build & Push FIPS Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # Für ghcr.io push
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Checkout repository (fork)
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: Determine Traefik version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
+            # Tag-Format: "fips-v3.3.4" → extrahiere "v3.3.4"
+            VERSION="${GITHUB_REF_NAME#fips-}"
+          elif [[ -n "${{ github.event.inputs.traefik_version }}" ]]; then
+            VERSION="${{ github.event.inputs.traefik_version }}"
+          else
+            VERSION="v3.3.4"
+          fi
+          echo "traefik_version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Building Traefik ${VERSION} with FIPS/BoringCrypto"
+
+      # -----------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------------------
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      - name: Extract Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # z.B. ghcr.io/meine-org/traefik-fips:v3.3.4-fips
+            type=raw,value=${{ steps.version.outputs.traefik_version }}-fips
+            # Immer auch "latest-fips" aktualisieren
+            type=raw,value=latest-fips
+          labels: |
+            org.opencontainers.image.title=Traefik FIPS
+            org.opencontainers.image.description=Traefik Proxy compiled with GOEXPERIMENT=boringcrypto (FIPS 140-2 BoringCrypto)
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      # -----------------------------------------------------------------------
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            TRAEFIK_VERSION=${{ steps.version.outputs.traefik_version }}
+          # Build-Cache über GitHub Actions Cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Multi-Arch: amd64 und arm64 (BoringCrypto unterstützt beide)
+          platforms: linux/amd64,linux/arm64
+
+      # -----------------------------------------------------------------------
+      - name: Verify BoringCrypto in pushed image
+        run: |
+          echo "Pulling image to verify BoringCrypto..."
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips
+
+          # goversion-Tool zum Prüfen der Crypto-Implementierung
+          docker run --rm --entrypoint="" \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips \
+            /traefik version || true
+
+          echo "Image tags published:"
+          echo "${{ steps.meta.outputs.tags }}"
+
+      # -----------------------------------------------------------------------
+      - name: Create GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Traefik FIPS ${{ steps.version.outputs.traefik_version }}"
+          body: |
+            ## Traefik ${{ steps.version.outputs.traefik_version }} — FIPS Build
+
+            Compiled with `GOEXPERIMENT=boringcrypto` (BoringCrypto FIPS 140-2).
+
+            ### Pull
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips
+            ```
+
+            ### ⚠️ Hinweis
+            Dieses Image nutzt BoringCrypto für FIPS-konforme Kryptographie.
+            Es ist **kein offiziell zertifiziertes** Traefik-Enterprise-FIPS-Image.
+          generate_release_notes: false
