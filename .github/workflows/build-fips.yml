@@ -5,10 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       traefik_version:
-        description: "Traefik version tag (e.g. v3.3.4)"
+        description: "Traefik version tag (e.g. v3.7.5)"
         required: false
-        default: "v3.3.4"
-  # Automatisch bei neuen Tags in deinem Fork, z.B. "fips-v3.3.4"
+        default: "v3.7.5"
+  # Automatisch bei neuen Tags in deinem Fork, z.B. "fips-v3.7.5"
   push:
     tags:
       - "fips-v*"
@@ -45,7 +45,7 @@ jobs:
           elif [[ -n "${{ github.event.inputs.traefik_version }}" ]]; then
             VERSION="${{ github.event.inputs.traefik_version }}"
           else
-            VERSION="v3.3.4"
+            VERSION="v3.7.5"
           fi
           echo "traefik_version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Building Traefik ${VERSION} with FIPS/BoringCrypto"
@@ -120,12 +120,10 @@ jobs:
 
             Compiled with `GOEXPERIMENT=boringcrypto` (BoringCrypto FIPS 140-2).
 
-            ### Pull
             ```bash
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips
             ```
 
-            ### ⚠️ Hinweis
-            Dieses Image nutzt BoringCrypto für FIPS-konforme Kryptographie.
-            Es ist **kein offiziell zertifiziertes** Traefik-Enterprise-FIPS-Image.
+            **Build-Info:** Go `golang:1.23` + `GOEXPERIMENT=boringcrypto`, WebUI via Yarn aus Quellcode.
+            ⚠️ Kein offiziell zertifiziertes Traefik-Enterprise-FIPS-Image.
           generate_release_notes: false
