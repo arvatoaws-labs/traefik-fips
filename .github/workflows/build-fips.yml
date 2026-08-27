@@ -149,7 +149,6 @@ jobs:
       packages: write # Für ghcr.io push
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         include: ${{ fromJson(needs.discover.outputs.matrix) }}
 
