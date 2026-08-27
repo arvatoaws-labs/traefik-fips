@@ -1,7 +1,6 @@
 name: Build Traefik FIPS Image
 
 on:
-  # Manuell auslösbar
   workflow_dispatch:
     inputs:
       traefik_version:
@@ -20,13 +19,8 @@ on:
         description: "Auch Versionen bauen, die bereits in der Registry existieren"
         required: false
         default: "true"
-  # Automatisch bei neuen Tags in deinem Fork, z.B. "fips-v3.7.5"
-  push:
-    tags:
-      - "fips-v*"
-  # Wöchentlicher Rebuild für Security-Patches im Basis-Image
   schedule:
-    - cron: "0 3 * * 1" # Montags 03:00 UTC
+  - cron: "0 10 * * *"
 
 env:
   # Deine GitHub Container Registry (ghcr.io)
