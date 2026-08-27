@@ -1,13 +1,25 @@
 name: Build Traefik FIPS Image
 
 on:
-  # Manuell auslösbar mit optionaler Versionsangabe
+  # Manuell auslösbar
   workflow_dispatch:
     inputs:
       traefik_version:
-        description: "Traefik version tag (e.g. v3.7.5)"
+        description: "Einzelne Version bauen (z.B. v3.7.5). Leer = alle passenden Releases"
         required: false
-        default: "v3.7.5"
+        default: ""
+      minimum_version:
+        description: "Releases älter als diese Version ignorieren"
+        required: false
+        default: "v3.0.0"
+      include_prereleases:
+        description: "Pre-Releases (RC/beta) einbeziehen"
+        required: false
+        default: "false"
+      force_rebuild:
+        description: "Auch Versionen bauen, die bereits in der Registry existieren"
+        required: false
+        default: "true"
   # Automatisch bei neuen Tags in deinem Fork, z.B. "fips-v3.7.5"
   push:
     tags:
@@ -23,32 +35,128 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/traefik-fips
 
 jobs:
+  # ===========================================================================
+  # Ermittelt die zu bauenden Traefik-Versionen (Build-Matrix)
+  # ===========================================================================
+  discover:
+    name: Discover Traefik releases
+    runs-on: arvato
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.versions.outputs.matrix }}
+      count: ${{ steps.versions.outputs.count }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      - name: Resolve Traefik versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.traefik_version }}
+          MINIMUM_VERSION: ${{ github.event.inputs.minimum_version || 'v3.0.0' }}
+          INCLUDE_PRERELEASES: ${{ github.event.inputs.include_prereleases || 'false' }}
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # --- Kandidaten ermitteln ------------------------------------------
+          if [[ "$EVENT_NAME" == "push" && "$REF_NAME" == fips-v* ]]; then
+            # Tag-Format: "fips-v3.3.4" → extrahiere "v3.3.4"
+            CANDIDATES="${REF_NAME#fips-}"
+            FORCE_REBUILD="true"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            CANDIDATES="${INPUT_VERSION}"
+            FORCE_REBUILD="true"
+          else
+            PRERELEASE_FILTER='select(.prerelease == false)'
+            if [[ "$INCLUDE_PRERELEASES" == "true" ]]; then
+              PRERELEASE_FILTER='.'
+            fi
+            CANDIDATES=$(gh api --paginate /repos/traefik/traefik/releases \
+                --jq ".[] | select(.draft == false) | ${PRERELEASE_FILTER} | .tag_name" \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
+              | sort -Vr)
+          fi
+
+          if [[ -z "${CANDIDATES}" ]]; then
+            echo "Keine Traefik-Releases gefunden." >&2
+            exit 1
+          fi
+
+          echo "Kandidaten:"
+          echo "${CANDIDATES}" | sed 's/^/  /'
+
+          # Nur die neueste Version erhält zusätzlich den "latest-fips" Tag
+          NEWEST=$(echo "${CANDIDATES}" | sort -Vr | head -n1)
+
+          # --- Filtern & Matrix aufbauen --------------------------------------
+          MATRIX="[]"
+          while read -r VERSION; do
+            [[ -z "${VERSION}" ]] && continue
+
+            # Mindestversion durchsetzen
+            OLDEST=$(printf '%s\n%s\n' "${MINIMUM_VERSION}" "${VERSION}" | sort -V | head -n1)
+            if [[ "${OLDEST}" != "${MINIMUM_VERSION}" ]]; then
+              echo "Überspringe ${VERSION} (älter als ${MINIMUM_VERSION})"
+              continue
+            fi
+
+            # Bereits veröffentlichte Images überspringen
+            # (schedule baut bewusst neu, um Basis-Image-Patches aufzunehmen)
+            if [[ "${FORCE_REBUILD}" != "true" && "${EVENT_NAME}" != "schedule" ]]; then
+              if docker buildx imagetools inspect \
+                  "${REGISTRY}/${IMAGE_NAME}:${VERSION}-fips" >/dev/null 2>&1; then
+                echo "Überspringe ${VERSION} (Image existiert bereits)"
+                continue
+              fi
+            fi
+
+            IS_LATEST="false"
+            [[ "${VERSION}" == "${NEWEST}" ]] && IS_LATEST="true"
+
+            MATRIX=$(echo "${MATRIX}" | jq -c \
+              --arg v "${VERSION}" --argjson l "${IS_LATEST}" \
+              '. + [{version: $v, is_latest: $l}]')
+          done <<< "${CANDIDATES}"
+
+          COUNT=$(echo "${MATRIX}" | jq 'length')
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "Zu bauende Versionen (${COUNT}): ${MATRIX}"
+
+  # ===========================================================================
+  # Baut & pusht ein Image pro ermittelter Version
+  # ===========================================================================
   build-and-push:
-    name: Build & Push FIPS Image
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.version }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: arvato
     permissions:
       contents: read
       packages: write # Für ghcr.io push
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     steps:
       # -----------------------------------------------------------------------
       - name: Checkout repository (fork)
         uses: actions/checkout@v4
-
-      # -----------------------------------------------------------------------
-      - name: Determine Traefik version
-        id: version
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
-            # Tag-Format: "fips-v3.3.4" → extrahiere "v3.3.4"
-            VERSION="${GITHUB_REF_NAME#fips-}"
-          elif [[ -n "${{ github.event.inputs.traefik_version }}" ]]; then
-            VERSION="${{ github.event.inputs.traefik_version }}"
-          else
-            VERSION="v3.7.5"
-          fi
-          echo "traefik_version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Building Traefik ${VERSION} with FIPS/BoringCrypto"
 
       # -----------------------------------------------------------------------
       - name: Set up Docker Buildx
@@ -68,14 +176,17 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
           tags: |
             # z.B. ghcr.io/meine-org/traefik-fips:v3.3.4-fips
-            type=raw,value=${{ steps.version.outputs.traefik_version }}-fips
-            # Immer auch "latest-fips" aktualisieren
-            type=raw,value=latest-fips
+            type=raw,value=${{ matrix.version }}-fips
+            # "latest-fips" nur für die neueste ermittelte Version
+            type=raw,value=latest-fips,enable=${{ matrix.is_latest }}
           labels: |
             org.opencontainers.image.title=Traefik FIPS
-            org.opencontainers.image.description=Traefik Proxy compiled with GOEXPERIMENT=boringcrypto (FIPS 140-2 BoringCrypto)
+            org.opencontainers.image.description=Traefik Proxy compiled with GOFIPS140=latest (Go FIPS 140-3 crypto module)
+            org.opencontainers.image.version=${{ matrix.version }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
 
       # -----------------------------------------------------------------------
@@ -88,39 +199,53 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            TRAEFIK_VERSION=${{ steps.version.outputs.traefik_version }}
-          # Multi-Arch: amd64 und arm64 (BoringCrypto unterstützt beide)
+            TRAEFIK_VERSION=${{ matrix.version }}
+          # Multi-Arch: amd64 und arm64
           platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=${{ matrix.version }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.version }}
 
       # -----------------------------------------------------------------------
-      - name: Verify BoringCrypto in pushed image
+      - name: Verify pushed image
         run: |
-          echo "Pulling image to verify BoringCrypto..."
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${{ matrix.version }}-fips"
+          echo "Pulling image to verify: ${IMAGE}"
+          docker pull "${IMAGE}"
 
-          # goversion-Tool zum Prüfen der Crypto-Implementierung
-          docker run --rm --entrypoint="" \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips \
-            /traefik version || true
+          docker run --rm --entrypoint="" "${IMAGE}" /traefik version || true
 
           echo "Image tags published:"
           echo "${{ steps.meta.outputs.tags }}"
 
-      # -----------------------------------------------------------------------
-      - name: Create GitHub Release (only on tag push)
-        if: startsWith(github.ref, 'refs/tags/')
+  # ===========================================================================
+  # GitHub Release nur bei Tag-Push
+  # ===========================================================================
+  release:
+    name: Create GitHub Release
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: arvato
+    permissions:
+      contents: write
+
+    steps:
+      - name: Determine version from tag
+        id: version
+        run: echo "traefik_version=${GITHUB_REF_NAME#fips-}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: "Traefik FIPS ${{ steps.version.outputs.traefik_version }}"
           body: |
             ## Traefik ${{ steps.version.outputs.traefik_version }} — FIPS Build
 
-            Compiled with `GOEXPERIMENT=boringcrypto` (BoringCrypto FIPS 140-2).
+            Compiled with `GOFIPS140=latest` (Go FIPS 140-3 Krypto-Modul).
 
             ```bash
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips
             ```
 
-            **Build-Info:** Go `golang:1.23` + `GOEXPERIMENT=boringcrypto`, WebUI via Yarn aus Quellcode.
+            **Build-Info:** `golang:bookworm` + `GOFIPS140=latest`, WebUI via Yarn aus Quellcode.
             ⚠️ Kein offiziell zertifiziertes Traefik-Enterprise-FIPS-Image.
           generate_release_notes: false
