@@ -49,92 +49,92 @@ jobs:
       count: ${{ steps.versions.outputs.count }}
 
     steps:
-      # -----------------------------------------------------------------------
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    # -----------------------------------------------------------------------
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      # -----------------------------------------------------------------------
-      - name: Resolve Traefik versions
-        id: versions
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          INPUT_VERSION: ${{ github.event.inputs.traefik_version }}
-          MINIMUM_VERSION: ${{ github.event.inputs.minimum_version || 'v3.0.0' }}
-          INCLUDE_PRERELEASES: ${{ github.event.inputs.include_prereleases || 'false' }}
-          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
-        run: |
-          set -euo pipefail
+    # -----------------------------------------------------------------------
+    - name: Resolve Traefik versions
+      id: versions
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        EVENT_NAME: ${{ github.event_name }}
+        REF_NAME: ${{ github.ref_name }}
+        INPUT_VERSION: ${{ github.event.inputs.traefik_version }}
+        MINIMUM_VERSION: ${{ github.event.inputs.minimum_version || 'v3.0.0' }}
+        INCLUDE_PRERELEASES: ${{ github.event.inputs.include_prereleases || 'false' }}
+        FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
+      run: |
+        set -euo pipefail
 
-          # --- Kandidaten ermitteln ------------------------------------------
-          if [[ "$EVENT_NAME" == "push" && "$REF_NAME" == fips-v* ]]; then
-            # Tag-Format: "fips-v3.3.4" → extrahiere "v3.3.4"
-            CANDIDATES="${REF_NAME#fips-}"
-            FORCE_REBUILD="true"
-          elif [[ -n "${INPUT_VERSION}" ]]; then
-            CANDIDATES="${INPUT_VERSION}"
-            FORCE_REBUILD="true"
-          else
-            PRERELEASE_FILTER='select(.prerelease == false)'
-            if [[ "$INCLUDE_PRERELEASES" == "true" ]]; then
-              PRERELEASE_FILTER='.'
-            fi
-            CANDIDATES=$(gh api --paginate /repos/traefik/traefik/releases \
-                --jq ".[] | select(.draft == false) | ${PRERELEASE_FILTER} | .tag_name" \
-              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
-              | sort -Vr)
+        # --- Kandidaten ermitteln ------------------------------------------
+        if [[ "$EVENT_NAME" == "push" && "$REF_NAME" == fips-v* ]]; then
+          # Tag-Format: "fips-v3.3.4" → extrahiere "v3.3.4"
+          CANDIDATES="${REF_NAME#fips-}"
+          FORCE_REBUILD="true"
+        elif [[ -n "${INPUT_VERSION}" ]]; then
+          CANDIDATES="${INPUT_VERSION}"
+          FORCE_REBUILD="true"
+        else
+          PRERELEASE_FILTER='select(.prerelease == false)'
+          if [[ "$INCLUDE_PRERELEASES" == "true" ]]; then
+            PRERELEASE_FILTER='.'
+          fi
+          CANDIDATES=$(gh api --paginate /repos/traefik/traefik/releases \
+              --jq ".[] | select(.draft == false) | ${PRERELEASE_FILTER} | .tag_name" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
+            | sort -Vr)
+        fi
+
+        if [[ -z "${CANDIDATES}" ]]; then
+          echo "Keine Traefik-Releases gefunden." >&2
+          exit 1
+        fi
+
+        echo "Kandidaten:"
+        echo "${CANDIDATES}" | sed 's/^/  /'
+
+        # Nur die neueste Version erhält zusätzlich den "latest-fips" Tag
+        NEWEST=$(echo "${CANDIDATES}" | sort -Vr | head -n1)
+
+        # --- Filtern & Matrix aufbauen --------------------------------------
+        MATRIX="[]"
+        while read -r VERSION; do
+          [[ -z "${VERSION}" ]] && continue
+
+          # Mindestversion durchsetzen
+          OLDEST=$(printf '%s\n%s\n' "${MINIMUM_VERSION}" "${VERSION}" | sort -V | head -n1)
+          if [[ "${OLDEST}" != "${MINIMUM_VERSION}" ]]; then
+            echo "Überspringe ${VERSION} (älter als ${MINIMUM_VERSION})"
+            continue
           fi
 
-          if [[ -z "${CANDIDATES}" ]]; then
-            echo "Keine Traefik-Releases gefunden." >&2
-            exit 1
-          fi
-
-          echo "Kandidaten:"
-          echo "${CANDIDATES}" | sed 's/^/  /'
-
-          # Nur die neueste Version erhält zusätzlich den "latest-fips" Tag
-          NEWEST=$(echo "${CANDIDATES}" | sort -Vr | head -n1)
-
-          # --- Filtern & Matrix aufbauen --------------------------------------
-          MATRIX="[]"
-          while read -r VERSION; do
-            [[ -z "${VERSION}" ]] && continue
-
-            # Mindestversion durchsetzen
-            OLDEST=$(printf '%s\n%s\n' "${MINIMUM_VERSION}" "${VERSION}" | sort -V | head -n1)
-            if [[ "${OLDEST}" != "${MINIMUM_VERSION}" ]]; then
-              echo "Überspringe ${VERSION} (älter als ${MINIMUM_VERSION})"
+          # Bereits veröffentlichte Images überspringen
+          # (schedule baut bewusst neu, um Basis-Image-Patches aufzunehmen)
+          if [[ "${FORCE_REBUILD}" != "true" && "${EVENT_NAME}" != "schedule" ]]; then
+            if docker buildx imagetools inspect \
+                "${REGISTRY}/${IMAGE_NAME}:${VERSION}-fips" >/dev/null 2>&1; then
+              echo "Überspringe ${VERSION} (Image existiert bereits)"
               continue
             fi
+          fi
 
-            # Bereits veröffentlichte Images überspringen
-            # (schedule baut bewusst neu, um Basis-Image-Patches aufzunehmen)
-            if [[ "${FORCE_REBUILD}" != "true" && "${EVENT_NAME}" != "schedule" ]]; then
-              if docker buildx imagetools inspect \
-                  "${REGISTRY}/${IMAGE_NAME}:${VERSION}-fips" >/dev/null 2>&1; then
-                echo "Überspringe ${VERSION} (Image existiert bereits)"
-                continue
-              fi
-            fi
+          IS_LATEST="false"
+          [[ "${VERSION}" == "${NEWEST}" ]] && IS_LATEST="true"
 
-            IS_LATEST="false"
-            [[ "${VERSION}" == "${NEWEST}" ]] && IS_LATEST="true"
+          MATRIX=$(echo "${MATRIX}" | jq -c \
+            --arg v "${VERSION}" --argjson l "${IS_LATEST}" \
+            '. + [{version: $v, is_latest: $l}]')
+        done <<< "${CANDIDATES}"
 
-            MATRIX=$(echo "${MATRIX}" | jq -c \
-              --arg v "${VERSION}" --argjson l "${IS_LATEST}" \
-              '. + [{version: $v, is_latest: $l}]')
-          done <<< "${CANDIDATES}"
-
-          COUNT=$(echo "${MATRIX}" | jq 'length')
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
-          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
-          echo "Zu bauende Versionen (${COUNT}): ${MATRIX}"
+        COUNT=$(echo "${MATRIX}" | jq 'length')
+        echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+        echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+        echo "Zu bauende Versionen (${COUNT}): ${MATRIX}"
 
   # ===========================================================================
   # Baut pro Version und Architektur nativ (kein QEMU) und pusht per Digest
@@ -161,73 +161,73 @@ jobs:
             runner: arvato
 
     steps:
-      # -----------------------------------------------------------------------
-      - name: Checkout repository (fork)
-        uses: actions/checkout@v4
+    # -----------------------------------------------------------------------
+    - name: Checkout repository (fork)
+      uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+    # -----------------------------------------------------------------------
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
-      # -----------------------------------------------------------------------
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    # -----------------------------------------------------------------------
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      # -----------------------------------------------------------------------
-      - name: Extract Docker metadata (labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          labels: |
-            org.opencontainers.image.title=Traefik FIPS
-            org.opencontainers.image.description=Traefik Proxy compiled with GOFIPS140=latest (Go FIPS 140-3 crypto module)
-            org.opencontainers.image.version=${{ matrix.target.version }}
-            org.opencontainers.image.vendor=${{ github.repository_owner }}
+    # -----------------------------------------------------------------------
+    - name: Extract Docker metadata (labels)
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        labels: |
+          org.opencontainers.image.title=Traefik FIPS
+          org.opencontainers.image.description=Traefik Proxy compiled with GOFIPS140=latest (Go FIPS 140-3 crypto module)
+          org.opencontainers.image.version=${{ matrix.target.version }}
+          org.opencontainers.image.vendor=${{ github.repository_owner }}
 
-      # -----------------------------------------------------------------------
-      # Push ohne Tag: nur per Digest, der Manifest-Join setzt später die Tags
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform.docker }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            TRAEFIK_VERSION=${{ matrix.target.version }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.target.version }}-${{ matrix.platform.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target.version }}-${{ matrix.platform.arch }}
+    # -----------------------------------------------------------------------
+    # Push ohne Tag: nur per Digest, der Manifest-Join setzt später die Tags
+    - name: Build and push by digest
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: ${{ matrix.platform.docker }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          TRAEFIK_VERSION=${{ matrix.target.version }}
+        outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+        cache-from: type=gha,scope=${{ matrix.target.version }}-${{ matrix.platform.arch }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.target.version }}-${{ matrix.platform.arch }}
 
-      # -----------------------------------------------------------------------
-      - name: Export digest
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/digests
-          # Artefakt-Dateinamen dürfen kein ":" enthalten -> Algorithmus-Präfix entfernen
-          SANITIZED=$(printf '%s' "${DIGEST}" | sed -E 's/^sha256://; s/[^a-zA-Z0-9._-]/-/g')
-          if [[ -z "${SANITIZED}" ]]; then
-            echo "Leerer Digest von build-push-action erhalten." >&2
-            exit 1
-          fi
-          touch "/tmp/digests/${SANITIZED}"
+    # -----------------------------------------------------------------------
+    - name: Export digest
+      env:
+        DIGEST: ${{ steps.build.outputs.digest }}
+      run: |
+        set -euo pipefail
+        mkdir -p /tmp/digests
+        # Artefakt-Dateinamen dürfen kein ":" enthalten -> Algorithmus-Präfix entfernen
+        SANITIZED=$(printf '%s' "${DIGEST}" | sed -E 's/^sha256://; s/[^a-zA-Z0-9._-]/-/g')
+        if [[ -z "${SANITIZED}" ]]; then
+          echo "Leerer Digest von build-push-action erhalten." >&2
+          exit 1
+        fi
+        touch "/tmp/digests/${SANITIZED}"
 
-      # -----------------------------------------------------------------------
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.target.version }}-${{ matrix.platform.arch }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
+    # -----------------------------------------------------------------------
+    - name: Upload digest
+      uses: actions/upload-artifact@v4
+      with:
+        name: digests-${{ matrix.target.version }}-${{ matrix.platform.arch }}
+        path: /tmp/digests/*
+        if-no-files-found: error
+        retention-days: 1
 
   # ===========================================================================
   # Fügt die nativen Builds zu einem Multi-Arch-Manifest zusammen
@@ -246,99 +246,66 @@ jobs:
         include: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     steps:
-      # -----------------------------------------------------------------------
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-${{ matrix.version }}-*
-          merge-multiple: true
+    # -----------------------------------------------------------------------
+    - name: Download digests
+      uses: actions/download-artifact@v4
+      with:
+        path: /tmp/digests
+        pattern: digests-${{ matrix.version }}-*
+        merge-multiple: true
 
-      # -----------------------------------------------------------------------
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+    # -----------------------------------------------------------------------
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
-      # -----------------------------------------------------------------------
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    # -----------------------------------------------------------------------
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      # -----------------------------------------------------------------------
-      - name: Extract Docker metadata (tags)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            # z.B. ghcr.io/meine-org/traefik-fips:v3.3.4-fips
-            type=raw,value=${{ matrix.version }}-fips
-            # "latest-fips" nur für die neueste ermittelte Version
-            type=raw,value=latest-fips,enable=${{ matrix.is_latest }}
+    # -----------------------------------------------------------------------
+    - name: Extract Docker metadata (tags)
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        flavor: |
+          latest=false
+        tags: |
+          # z.B. ghcr.io/meine-org/traefik-fips:v3.3.4-fips
+          type=raw,value=${{ matrix.version }}-fips
+          # "latest-fips" nur für die neueste ermittelte Version
+          type=raw,value=latest-fips,enable=${{ matrix.is_latest }}
 
-      # -----------------------------------------------------------------------
-      - name: Create manifest list and push
-        working-directory: /tmp/digests
-        run: |
-          set -euo pipefail
-          # Dateinamen sind die sanitisierten Digests -> "sha256:" wieder voranstellen
-          SOURCES=""
-          for FILE in *; do
-            DIGEST=$(basename "${FILE}")
-            DIGEST="${DIGEST#sha256:}"
-            DIGEST="${DIGEST#sha256-}"
-            SOURCES+="${REGISTRY}/${IMAGE_NAME}@sha256:${DIGEST} "
-          done
+    # -----------------------------------------------------------------------
+    - name: Create manifest list and push
+      working-directory: /tmp/digests
+      run: |
+        set -euo pipefail
+        # Dateinamen sind die sanitisierten Digests -> "sha256:" wieder voranstellen
+        SOURCES=""
+        for FILE in *; do
+          DIGEST=$(basename "${FILE}")
+          DIGEST="${DIGEST#sha256:}"
+          DIGEST="${DIGEST#sha256-}"
+          SOURCES+="${REGISTRY}/${IMAGE_NAME}@sha256:${DIGEST} "
+        done
 
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            ${SOURCES}
+        docker buildx imagetools create \
+          $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          ${SOURCES}
 
-      # -----------------------------------------------------------------------
-      - name: Verify pushed image
-        run: |
-          IMAGE="${REGISTRY}/${IMAGE_NAME}:${{ matrix.version }}-fips"
-          echo "Inspecting manifest: ${IMAGE}"
-          docker buildx imagetools inspect "${IMAGE}"
+    # -----------------------------------------------------------------------
+    - name: Verify pushed image
+      run: |
+        IMAGE="${REGISTRY}/${IMAGE_NAME}:${{ matrix.version }}-fips"
+        echo "Inspecting manifest: ${IMAGE}"
+        docker buildx imagetools inspect "${IMAGE}"
 
-          docker run --rm --entrypoint="" "${IMAGE}" /traefik version || true
+        docker run --rm --entrypoint="" "${IMAGE}" /traefik version || true
 
-          echo "Image tags published:"
-          echo "${{ steps.meta.outputs.tags }}"
-
-  # ===========================================================================
-  # GitHub Release nur bei Tag-Push
-  # ===========================================================================
-  release:
-    name: Create GitHub Release
-    needs: merge
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: arvato
-    permissions:
-      contents: write
-
-    steps:
-      - name: Determine version from tag
-        id: version
-        run: echo "traefik_version=${GITHUB_REF_NAME#fips-}" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: "Traefik FIPS ${{ steps.version.outputs.traefik_version }}"
-          body: |
-            ## Traefik ${{ steps.version.outputs.traefik_version }} — FIPS Build
-
-            Compiled with `GOFIPS140=latest` (Go FIPS 140-3 Krypto-Modul).
-
-            ```bash
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.traefik_version }}-fips
-            ```
-
-            **Build-Info:** `golang:bookworm` + `GOFIPS140=latest`, WebUI via Yarn aus Quellcode.
-            ⚠️ Kein offiziell zertifiziertes Traefik-Enterprise-FIPS-Image.
-          generate_release_notes: false
+        echo "Image tags published:"
+        echo "${{ steps.meta.outputs.tags }}"
