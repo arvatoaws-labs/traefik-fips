@@ -137,20 +137,27 @@ jobs:
           echo "Zu bauende Versionen (${COUNT}): ${MATRIX}"
 
   # ===========================================================================
-  # Baut & pusht ein Image pro ermittelter Version
+  # Baut pro Version und Architektur nativ (kein QEMU) und pusht per Digest
   # ===========================================================================
-  build-and-push:
-    name: Build ${{ matrix.version }}
+  build:
+    name: Build ${{ matrix.target.version }} (${{ matrix.platform.arch }})
     needs: discover
     if: needs.discover.outputs.count != '0'
-    runs-on: arvato
+    runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read
       packages: write # Für ghcr.io push
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+        target: ${{ fromJson(needs.discover.outputs.matrix) }}
+        platform:
+          - arch: amd64
+            docker: linux/amd64
+            runner: arvato-x86
+          - arch: arm64
+            docker: linux/arm64
+            runner: arvato
 
     steps:
       # -----------------------------------------------------------------------
@@ -170,7 +177,87 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------------
-      - name: Extract Docker metadata (tags & labels)
+      - name: Extract Docker metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=Traefik FIPS
+            org.opencontainers.image.description=Traefik Proxy compiled with GOFIPS140=latest (Go FIPS 140-3 crypto module)
+            org.opencontainers.image.version=${{ matrix.target.version }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      # -----------------------------------------------------------------------
+      # Push ohne Tag: nur per Digest, der Manifest-Join setzt später die Tags
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform.docker }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            TRAEFIK_VERSION=${{ matrix.target.version }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.target.version }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target.version }}-${{ matrix.platform.arch }}
+
+      # -----------------------------------------------------------------------
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+
+      # -----------------------------------------------------------------------
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.target.version }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ===========================================================================
+  # Fügt die nativen Builds zu einem Multi-Arch-Manifest zusammen
+  # ===========================================================================
+  merge:
+    name: Merge manifest ${{ matrix.version }}
+    needs: [discover, build]
+    runs-on: arvato
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.version }}-*
+          merge-multiple: true
+
+      # -----------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------------------
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      - name: Extract Docker metadata (tags)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -182,34 +269,22 @@ jobs:
             type=raw,value=${{ matrix.version }}-fips
             # "latest-fips" nur für die neueste ermittelte Version
             type=raw,value=latest-fips,enable=${{ matrix.is_latest }}
-          labels: |
-            org.opencontainers.image.title=Traefik FIPS
-            org.opencontainers.image.description=Traefik Proxy compiled with GOFIPS140=latest (Go FIPS 140-3 crypto module)
-            org.opencontainers.image.version=${{ matrix.version }}
-            org.opencontainers.image.vendor=${{ github.repository_owner }}
 
       # -----------------------------------------------------------------------
-      - name: Build and push image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            TRAEFIK_VERSION=${{ matrix.version }}
-          # Multi-Arch: amd64 und arm64
-          platforms: linux/amd64,linux/arm64
-          cache-from: type=gha,scope=${{ matrix.version }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.version }}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
 
       # -----------------------------------------------------------------------
       - name: Verify pushed image
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAME}:${{ matrix.version }}-fips"
-          echo "Pulling image to verify: ${IMAGE}"
-          docker pull "${IMAGE}"
+          echo "Inspecting manifest: ${IMAGE}"
+          docker buildx imagetools inspect "${IMAGE}"
 
           docker run --rm --entrypoint="" "${IMAGE}" /traefik version || true
 
@@ -221,7 +296,7 @@ jobs:
   # ===========================================================================
   release:
     name: Create GitHub Release
-    needs: build-and-push
+    needs: merge
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: arvato
     permissions:
