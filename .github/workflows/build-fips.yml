@@ -11,7 +11,7 @@ on:
       minimum_version:
         description: "Releases älter als diese Version ignorieren"
         required: false
-        default: "v3.0.0"
+        default: "v3.4.0"
       include_prereleases:
         description: "Pre-Releases (RC/beta) einbeziehen"
         required: false
@@ -149,6 +149,7 @@ jobs:
       packages: write # Für ghcr.io push
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix:
         target: ${{ fromJson(needs.discover.outputs.matrix) }}
         platform:
@@ -240,6 +241,7 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix:
         include: ${{ fromJson(needs.discover.outputs.matrix) }}
 
