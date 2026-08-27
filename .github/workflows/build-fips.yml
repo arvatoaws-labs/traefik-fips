@@ -206,10 +206,18 @@ jobs:
 
       # -----------------------------------------------------------------------
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          # Artefakt-Dateinamen dürfen kein ":" enthalten -> Algorithmus-Präfix entfernen
+          SANITIZED=$(printf '%s' "${DIGEST}" | sed -E 's/^sha256://; s/[^a-zA-Z0-9._-]/-/g')
+          if [[ -z "${SANITIZED}" ]]; then
+            echo "Leerer Digest von build-push-action erhalten." >&2
+            exit 1
+          fi
+          touch "/tmp/digests/${SANITIZED}"
 
       # -----------------------------------------------------------------------
       - name: Upload digest
@@ -275,9 +283,18 @@ jobs:
         working-directory: /tmp/digests
         run: |
           set -euo pipefail
+          # Dateinamen sind die sanitisierten Digests -> "sha256:" wieder voranstellen
+          SOURCES=""
+          for FILE in *; do
+            DIGEST=$(basename "${FILE}")
+            DIGEST="${DIGEST#sha256:}"
+            DIGEST="${DIGEST#sha256-}"
+            SOURCES+="${REGISTRY}/${IMAGE_NAME}@sha256:${DIGEST} "
+          done
+
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
+            ${SOURCES}
 
       # -----------------------------------------------------------------------
       - name: Verify pushed image
