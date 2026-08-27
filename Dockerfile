@@ -1,15 +1,11 @@
 # =============================================================================
 # Stage 1: WebUI mit Node.js/Yarn bauen
 # =============================================================================
-ARG TRAEFIK_VERSION=v3.7.5
-
-FROM node:20-bullseye-slim AS webui-builder
+FROM node:24-alpine AS webui-builder
 
 ARG TRAEFIK_VERSION
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache git ca-certificates
 
 WORKDIR /src
 
@@ -18,13 +14,17 @@ RUN git clone --depth=1 --branch=${TRAEFIK_VERSION} \
 
 WORKDIR /src/webui
 
-RUN corepack enable && yarn install --frozen-lockfile
-RUN corepack enable && yarn build
+RUN npm i -g @aikidosec/safe-chain
+RUN safe-chain setup-ci
+
+RUN corepack enable
+RUN yarn install --frozen-lockfile
+RUN yarn build
 
 # =============================================================================
 # Stage 2: Traefik mit GOFIPS140=latest kompilieren (Go 1.25+)
 # =============================================================================
-FROM golang:bookworm AS builder
+FROM golang:alpine AS builder
 
 ARG TRAEFIK_VERSION
 
@@ -32,9 +32,7 @@ ENV CGO_ENABLED=1
 ENV GOOS=linux
 ENV GOFIPS140=latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache gcc libc-dev git ca-certificates
 
 RUN go version && go env GOFIPS140
 
@@ -67,7 +65,9 @@ RUN echo "=== FIPS Verification ===" \
 # =============================================================================
 # Stage 3: Minimales Laufzeit-Image
 # =============================================================================
-FROM gcr.io/distroless/base-debian12:nonroot AS runtime
+FROM alpine AS runtime
+
+RUN apk add --no-cache --no-progress ca-certificates tzdata
 
 COPY --from=builder /traefik /traefik
 
