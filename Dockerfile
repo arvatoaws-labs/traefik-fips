@@ -1,7 +1,8 @@
 # =============================================================================
 # Stage 1: WebUI mit Node.js/Yarn bauen
 # =============================================================================
-FROM node:24-alpine AS webui-builder
+# FROM node:24-alpine AS webui-builder # is incompatible with traefik-ui version: error traefik-ui@2.0.0: The engine "node" is incompatible with this module. Expected version "^20 || ^18 || ^16". Got "24.21.0" 
+FROM node:20-alpine AS webui-builder
 
 ARG TRAEFIK_VERSION
 
