@@ -27,6 +27,11 @@ env:
   REGISTRY: ghcr.io
   # Passe dies an deine GitHub Org/User an
   IMAGE_NAME: ${{ github.repository_owner }}/traefik-fips
+  # Defaults für schedule-Runs (müssen mit den workflow_dispatch-Input-Defaults
+  # übereinstimmen, da github.event.inputs bei schedule leer ist)
+  DEFAULT_MINIMUM_VERSION: v3.4.0
+  DEFAULT_INCLUDE_PRERELEASES: "false"
+  DEFAULT_FORCE_REBUILD: "true"
 
 jobs:
   # ===========================================================================
@@ -45,7 +50,7 @@ jobs:
     steps:
     # -----------------------------------------------------------------------
     - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
@@ -59,9 +64,9 @@ jobs:
         EVENT_NAME: ${{ github.event_name }}
         REF_NAME: ${{ github.ref_name }}
         INPUT_VERSION: ${{ github.event.inputs.traefik_version }}
-        MINIMUM_VERSION: ${{ github.event.inputs.minimum_version || 'v3.0.0' }}
-        INCLUDE_PRERELEASES: ${{ github.event.inputs.include_prereleases || 'false' }}
-        FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
+        MINIMUM_VERSION: ${{ github.event.inputs.minimum_version || env.DEFAULT_MINIMUM_VERSION }}
+        INCLUDE_PRERELEASES: ${{ github.event.inputs.include_prereleases || env.DEFAULT_INCLUDE_PRERELEASES }}
+        FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || env.DEFAULT_FORCE_REBUILD }}
       run: |
         set -euo pipefail
 
@@ -157,15 +162,15 @@ jobs:
     steps:
     # -----------------------------------------------------------------------
     - name: Checkout repository (fork)
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     # -----------------------------------------------------------------------
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     # -----------------------------------------------------------------------
     - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
@@ -174,7 +179,7 @@ jobs:
     # -----------------------------------------------------------------------
     - name: Extract Docker metadata (labels)
       id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@v6
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         labels: |
@@ -187,7 +192,7 @@ jobs:
     # Push ohne Tag: nur per Digest, der Manifest-Join setzt später die Tags
     - name: Build and push by digest
       id: build
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v7
       with:
         context: .
         file: ./Dockerfile
@@ -216,7 +221,7 @@ jobs:
 
     # -----------------------------------------------------------------------
     - name: Upload digest
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: digests-${{ matrix.target.version }}-${{ matrix.platform.arch }}
         path: /tmp/digests/*
@@ -242,7 +247,7 @@ jobs:
     steps:
     # -----------------------------------------------------------------------
     - name: Download digests
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         path: /tmp/digests
         pattern: digests-${{ matrix.version }}-*
@@ -250,11 +255,11 @@ jobs:
 
     # -----------------------------------------------------------------------
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     # -----------------------------------------------------------------------
     - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
@@ -263,7 +268,7 @@ jobs:
     # -----------------------------------------------------------------------
     - name: Extract Docker metadata (tags)
       id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@v6
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         flavor: |
