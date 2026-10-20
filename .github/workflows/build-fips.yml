@@ -10,7 +10,7 @@ on:
       minimum_version:
         description: "Releases älter als diese Version ignorieren"
         required: false
-        default: "v3.4.0"
+        default: "v3.7.0"
       include_prereleases:
         description: "Pre-Releases (RC/beta) einbeziehen"
         required: false
@@ -29,7 +29,7 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/traefik-fips
   # Defaults für schedule-Runs (müssen mit den workflow_dispatch-Input-Defaults
   # übereinstimmen, da github.event.inputs bei schedule leer ist)
-  DEFAULT_MINIMUM_VERSION: v3.4.0
+  DEFAULT_MINIMUM_VERSION: v3.7.0
   DEFAULT_INCLUDE_PRERELEASES: "false"
   DEFAULT_FORCE_REBUILD: "true"
 
